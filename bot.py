@@ -12,16 +12,19 @@ Telegram-бот для Николая Хоавило (@prosto_prodash).
 достаточно самого факта, что бот состоит в админах канала).
 
 Команда /myid — присылает ваш chat_id, чтобы один раз настроить ADMIN_CHAT_ID.
+Команда /stats — присылает, сколько раз всего выдавался гайд (только вам, ADMIN_CHAT_ID).
 
 Переменные окружения:
   TELEGRAM_BOT_TOKEN    — токен бота от @BotFather (обязательно)
   CHANNEL_USERNAME      — username канала для проверки подписки, с @ (по умолчанию @prosto_prodash)
-  ADMIN_CHAT_ID         — ваш personal chat_id для уведомлений (необязательно)
+  ADMIN_CHAT_ID         — ваш personal chat_id для уведомлений и доступа к /stats (необязательно)
   CHANNEL_URL           — ссылка на канал для кнопки (по умолчанию https://t.me/prosto_prodash)
   TRAINING_CONTACT_URL  — ссылка на запись на тренинг (по умолчанию https://t.me/prosto_prodash_pr)
   PORT                  — порт для health-check сервера (задаётся хостингом автоматически)
+  STATS_PATH            — путь к файлу счётчика (по умолчанию рядом с bot.py; см. README про Volume)
 """
 
+import json
 import logging
 import os
 import threading
@@ -48,9 +51,41 @@ CHANNEL_USERNAME = os.environ.get("CHANNEL_USERNAME", "@prosto_prodash")
 CHANNEL_URL = os.environ.get("CHANNEL_URL", "https://t.me/prosto_prodash")
 TRAINING_CONTACT_URL = os.environ.get("TRAINING_CONTACT_URL", "https://t.me/prosto_prodash_pr")
 PDF_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "lead_magnet.pdf")
+STATS_PATH = os.environ.get(
+    "STATS_PATH", os.path.join(os.path.dirname(os.path.abspath(__file__)), "stats.json")
+)
 
 SUBSCRIBED_STATUSES = {"member", "administrator", "creator"}
 CHECK_SUB_CALLBACK = "check_subscription"
+
+_stats_lock = threading.Lock()
+
+
+def _load_stats() -> dict:
+    try:
+        with open(STATS_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {"guide_deliveries": 0}
+
+
+def increment_guide_deliveries() -> int:
+    """Увеличивает счётчик выдач гайда на 1 и возвращает новое значение.
+
+    Считает КАЖДУЮ фактическую отправку файла (в т.ч. повторные /start от
+    одного и того же человека) — то есть "сколько раз скачали", а не
+    "сколько разных людей скачали".
+    """
+    with _stats_lock:
+        data = _load_stats()
+        data["guide_deliveries"] = data.get("guide_deliveries", 0) + 1
+        with open(STATS_PATH, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+        return data["guide_deliveries"]
+
+
+def get_guide_deliveries() -> int:
+    return _load_stats().get("guide_deliveries", 0)
 
 WELCOME_TEXT = (
     "Привет! 👋 Меня зовут Николай Хоавило — я тренер по продажам и переговорам, "
@@ -110,6 +145,7 @@ async def is_subscribed(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> boo
 async def deliver_lead_magnet(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user) -> None:
     await context.bot.send_message(chat_id=chat_id, text=WELCOME_TEXT)
 
+    total = None
     try:
         with open(PDF_PATH, "rb") as f:
             await context.bot.send_document(
@@ -119,6 +155,7 @@ async def deliver_lead_magnet(context: ContextTypes.DEFAULT_TYPE, chat_id: int, 
                 caption=CAPTION_TEXT,
                 reply_markup=main_keyboard(),
             )
+        total = increment_guide_deliveries()
     except FileNotFoundError:
         logger.error("PDF file not found at %s", PDF_PATH)
         await context.bot.send_message(
@@ -129,6 +166,7 @@ async def deliver_lead_magnet(context: ContextTypes.DEFAULT_TYPE, chat_id: int, 
 
     if ADMIN_CHAT_ID:
         username = f"@{user.username}" if user.username else "(без username)"
+        counter_line = f"Всего выдач гайда: {total}\n" if total is not None else ""
         try:
             await context.bot.send_message(
                 chat_id=ADMIN_CHAT_ID,
@@ -136,7 +174,8 @@ async def deliver_lead_magnet(context: ContextTypes.DEFAULT_TYPE, chat_id: int, 
                     f"🔔 Новый подписчик получил гайд!\n"
                     f"Имя: {user.full_name}\n"
                     f"Username: {username}\n"
-                    f"ID: {user.id}"
+                    f"ID: {user.id}\n"
+                    f"{counter_line}"
                 ),
             )
         except Exception:
@@ -180,6 +219,23 @@ async def myid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
+async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat = update.effective_chat
+
+    if not ADMIN_CHAT_ID:
+        await context.bot.send_message(
+            chat_id=chat.id,
+            text="Команда /stats недоступна: сначала задайте переменную ADMIN_CHAT_ID (см. /myid).",
+        )
+        return
+
+    if str(chat.id) != str(ADMIN_CHAT_ID):
+        return  # тихо игнорируем чужих
+
+    total = get_guide_deliveries()
+    await context.bot.send_message(chat_id=chat.id, text=f"📊 Гайд выдан: {total} раз(а)")
+
+
 async def fallback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "Нажмите /start, чтобы получить гайд по возражениям.",
@@ -214,6 +270,7 @@ def main() -> None:
     application = Application.builder().token(BOT_TOKEN).build()
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("myid", myid))
+    application.add_handler(CommandHandler("stats", stats))
     application.add_handler(CallbackQueryHandler(check_subscription_callback, pattern=f"^{CHECK_SUB_CALLBACK}$"))
     application.add_handler(MessageHandler(filters.ALL, fallback))
 
