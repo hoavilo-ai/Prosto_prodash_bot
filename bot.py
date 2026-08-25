@@ -211,11 +211,11 @@ async def myid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await context.bot.send_message(
         chat_id=chat.id,
         text=(
-            f"Ваш chat_id: `{chat.id}`\n\n"
+            f"Ваш chat_id: <code>{chat.id}</code>\n\n"
             "Скопируйте это значение в переменную окружения ADMIN_CHAT_ID, "
             "чтобы получать уведомления о новых подписчиках."
         ),
-        parse_mode=ParseMode.MARKDOWN,
+        parse_mode=ParseMode.HTML,
     )
 
 
@@ -240,6 +240,11 @@ async def fallback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "Нажмите /start, чтобы получить гайд по возражениям.",
     )
+
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Логирует необработанные исключения, чтобы бот не падал молча."""
+    logger.error("Unhandled exception while processing update %s", update, exc_info=context.error)
 
 
 def run_health_server() -> None:
@@ -273,6 +278,7 @@ def main() -> None:
     application.add_handler(CommandHandler("stats", stats))
     application.add_handler(CallbackQueryHandler(check_subscription_callback, pattern=f"^{CHECK_SUB_CALLBACK}$"))
     application.add_handler(MessageHandler(filters.ALL, fallback))
+    application.add_error_handler(error_handler)
 
     logger.info("Bot started, polling...")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
