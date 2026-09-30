@@ -20,15 +20,24 @@ Telegram-бот для Николая Хоавило (@prosto_prodash).
   ADMIN_CHAT_ID         — ваш personal chat_id для уведомлений и доступа к /stats (необязательно)
   CHANNEL_URL           — ссылка на канал для кнопки (по умолчанию https://t.me/prosto_prodash)
   TRAINING_CONTACT_URL  — ссылка на запись на тренинг (по умолчанию https://t.me/prosto_prodash_pr)
-  PORT                  — порт для health-check сервера (задаётся хостингом автоматически)
+  PORT                  — порт, на котором слушает вебхук (задаётся Railway автоматически)
+  WEBHOOK_URL           — публичный https-адрес бота; если не задан явно, собирается
+                          из RAILWAY_PUBLIC_DOMAIN, который Railway выдаёт сам
+                          после включения Public Networking для сервиса
+  WEBHOOK_SECRET        — необязательный секретный токен: Telegram присылает его в
+                          заголовке запроса, чтобы отличать настоящие обновления от чужих
   STATS_PATH            — путь к файлу счётчика (по умолчанию рядом с bot.py; см. README про Volume)
+
+РЕЖИМ РАБОТЫ: бот запускается через webhook (Application.run_webhook), а не через
+long polling — это позволяет хостингу "усыплять" процесс, когда нет входящих
+сообщений, и подходит для serverless/бесплатных тарифов (например, бесплатного
+плана Railway, который требует serverless-режим для always-free сервисов).
 """
 
 import json
 import logging
 import os
 import threading
-from http.server import BaseHTTPRequestHandler, HTTPServer
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
@@ -54,6 +63,13 @@ PDF_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "lead_magnet
 STATS_PATH = os.environ.get(
     "STATS_PATH", os.path.join(os.path.dirname(os.path.abspath(__file__)), "stats.json")
 )
+
+RAILWAY_PUBLIC_DOMAIN = os.environ.get("RAILWAY_PUBLIC_DOMAIN")
+WEBHOOK_URL = os.environ.get("WEBHOOK_URL") or (
+    f"https://{RAILWAY_PUBLIC_DOMAIN}" if RAILWAY_PUBLIC_DOMAIN else None
+)
+WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET")
+PORT = int(os.environ.get("PORT", "8443"))
 
 SUBSCRIBED_STATUSES = {"member", "administrator", "creator"}
 CHECK_SUB_CALLBACK = "check_subscription"
@@ -247,30 +263,17 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
     logger.error("Unhandled exception while processing update %s", update, exc_info=context.error)
 
 
-def run_health_server() -> None:
-    """Minimal HTTP server so hosts that require an open port (e.g. Render Web Service)
-    don't kill the process. Not needed on platforms like Railway workers, but harmless."""
-    port = int(os.environ.get("PORT", "8080"))
-
-    class Handler(BaseHTTPRequestHandler):
-        def do_GET(self):  # noqa: N802
-            self.send_response(200)
-            self.end_headers()
-            self.wfile.write(b"ok")
-
-        def log_message(self, format, *args):  # noqa: A002
-            pass  # silence default HTTP logging
-
-    HTTPServer(("0.0.0.0", port), Handler).serve_forever()
-
-
 def main() -> None:
     if not BOT_TOKEN:
         raise SystemExit(
             "Не задан TELEGRAM_BOT_TOKEN. Установите переменную окружения с токеном от @BotFather."
         )
-
-    threading.Thread(target=run_health_server, daemon=True).start()
+    if not WEBHOOK_URL:
+        raise SystemExit(
+            "Не удалось определить адрес вебхука: задайте переменную WEBHOOK_URL явно, "
+            "либо включите Public Networking для сервиса в Railway — тогда появится "
+            "переменная RAILWAY_PUBLIC_DOMAIN и адрес соберётся автоматически."
+        )
 
     application = Application.builder().token(BOT_TOKEN).build()
     application.add_handler(CommandHandler("start", start))
@@ -280,8 +283,20 @@ def main() -> None:
     application.add_handler(MessageHandler(filters.ALL, fallback))
     application.add_error_handler(error_handler)
 
-    logger.info("Bot started, polling...")
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    # Путь вебхука строим из токена бота — Telegram и так его знает, а для всех
+    # остальных запрос на "какой угодно другой путь" будет просто 404.
+    url_path = BOT_TOKEN
+    full_webhook_url = f"{WEBHOOK_URL}/{url_path}"
+
+    logger.info("Bot started, listening for webhook updates on port %s...", PORT)
+    application.run_webhook(
+        listen="0.0.0.0",
+        port=PORT,
+        url_path=url_path,
+        webhook_url=full_webhook_url,
+        secret_token=WEBHOOK_SECRET,
+        allowed_updates=Update.ALL_TYPES,
+    )
 
 
 if __name__ == "__main__":
