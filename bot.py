@@ -30,6 +30,7 @@ Telegram-бот для Николая Хоавило (@prosto_prodash).
   ADMIN_CHAT_ID         — ваш personal chat_id для уведомлений, /stats, /grant, /revoke
   CHANNEL_URL           — ссылка на канал для кнопки (по умолчанию https://t.me/prosto_prodash)
   TRAINING_CONTACT_URL  — ссылка на запись на тренинг (по умолчанию https://t.me/prosto_prodash_pr)
+  INSTAGRAM_URL         — ссылка на Instagram для кнопки меню (по умолчанию https://instagram.com/hoavilo)
   WORKBOOK_CONTACT_URL  — куда направлять за покупкой тетради тех, у кого ещё нет доступа
                           (по умолчанию совпадает с TRAINING_CONTACT_URL, пока нет
                           автоматической оплаты — доступ выдаётся вручную через /grant
@@ -62,7 +63,14 @@ from typing import Optional
 from urllib.parse import parse_qsl
 
 from aiohttp import web
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update, WebAppInfo
+from telegram import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    KeyboardButton,
+    ReplyKeyboardMarkup,
+    Update,
+    WebAppInfo,
+)
 from telegram.constants import ParseMode
 from telegram.error import TelegramError
 from telegram.ext import (
@@ -85,6 +93,7 @@ CHANNEL_USERNAME = os.environ.get("CHANNEL_USERNAME", "@prosto_prodash")
 CHANNEL_URL = os.environ.get("CHANNEL_URL", "https://t.me/prosto_prodash")
 TRAINING_CONTACT_URL = os.environ.get("TRAINING_CONTACT_URL", "https://t.me/prosto_prodash_pr")
 WORKBOOK_CONTACT_URL = os.environ.get("WORKBOOK_CONTACT_URL", TRAINING_CONTACT_URL)
+INSTAGRAM_URL = os.environ.get("INSTAGRAM_URL", "https://instagram.com/hoavilo")
 PDF_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "lead_magnet.pdf")
 STATS_PATH = os.environ.get(
     "STATS_PATH", os.path.join(os.path.dirname(os.path.abspath(__file__)), "stats.json")
@@ -276,6 +285,27 @@ def main_keyboard() -> InlineKeyboardMarkup:
     )
 
 
+# ------------------------------------------------------------------------
+# Постоянное меню бота (reply-клавиатура, видна под полем ввода всегда)
+# ------------------------------------------------------------------------
+
+BTN_FREE_GUIDE = "🎁 Бесплатный гайд"
+BTN_CHANNEL = "📚 Канал с разборами"
+BTN_MINI_PRODUCT = "📘 Мини-продукт"
+BTN_INSTAGRAM = "📸 Инстаграм"
+
+
+def main_reply_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        [
+            [KeyboardButton(BTN_FREE_GUIDE), KeyboardButton(BTN_CHANNEL)],
+            [KeyboardButton(BTN_MINI_PRODUCT), KeyboardButton(BTN_INSTAGRAM)],
+        ],
+        resize_keyboard=True,
+        is_persistent=True,
+    )
+
+
 def gate_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
@@ -316,7 +346,7 @@ async def is_subscribed(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> boo
 
 
 async def deliver_lead_magnet(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user) -> None:
-    await context.bot.send_message(chat_id=chat_id, text=WELCOME_TEXT)
+    await context.bot.send_message(chat_id=chat_id, text=WELCOME_TEXT, reply_markup=main_reply_keyboard())
 
     total = None
     try:
@@ -362,7 +392,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if await is_subscribed(context, user.id):
         await deliver_lead_magnet(context, chat.id, user)
     else:
-        await context.bot.send_message(chat_id=chat.id, text=GATE_TEXT, reply_markup=gate_keyboard())
+        await context.bot.send_message(
+            chat_id=chat.id, text=GATE_TEXT, reply_markup=main_reply_keyboard()
+        )
+        await context.bot.send_message(
+            chat_id=chat.id,
+            text="⬆️ Подпишитесь и нажмите кнопку ниже, чтобы забрать гайд:",
+            reply_markup=gate_keyboard(),
+        )
 
 
 async def check_subscription_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -495,6 +532,22 @@ async def revoke(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await context.bot.send_message(chat_id=chat.id, text=text)
 
 
+async def channel_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat = update.effective_chat
+    await context.bot.send_message(
+        chat_id=chat.id,
+        text=f"📚 Канал с разборами продаж и переговоров:\n{CHANNEL_URL}",
+    )
+
+
+async def instagram_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat = update.effective_chat
+    await context.bot.send_message(
+        chat_id=chat.id,
+        text=f"📸 Мой Instagram:\n{INSTAGRAM_URL}",
+    )
+
+
 async def fallback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "Нажмите /start, чтобы получить гайд по возражениям, или /workbook — за тетрадью.",
@@ -587,6 +640,10 @@ def build_ptb_application() -> Application:
     application.add_handler(CommandHandler("grant", grant))
     application.add_handler(CommandHandler("revoke", revoke))
     application.add_handler(CallbackQueryHandler(check_subscription_callback, pattern=f"^{CHECK_SUB_CALLBACK}$"))
+    application.add_handler(MessageHandler(filters.Text([BTN_FREE_GUIDE]), start))
+    application.add_handler(MessageHandler(filters.Text([BTN_CHANNEL]), channel_button))
+    application.add_handler(MessageHandler(filters.Text([BTN_MINI_PRODUCT]), workbook))
+    application.add_handler(MessageHandler(filters.Text([BTN_INSTAGRAM]), instagram_button))
     application.add_handler(MessageHandler(filters.ALL, fallback))
     application.add_error_handler(error_handler)
     return application
