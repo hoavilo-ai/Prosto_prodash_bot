@@ -24,8 +24,33 @@ Telegram-бот для Николая Хоавило (@prosto_prodash).
   /grant <id> [note] — выдать доступ к тетради пользователю с этим telegram id (только ADMIN_CHAT_ID)
   /revoke <id>       — забрать доступ (только ADMIN_CHAT_ID)
 
+Кроме того, бот умеет готовить ЗА Николая черновики текста через Anthropic API
+(Claude) — и для ответов людям, которые пишут боту в личку, и для новых постов
+в канал. Ни один такой текст не уходит человеку или в канал без подтверждения
+Николая:
+  • Лид/подписчик пишет боту что-то своими словами → бот присылает Николаю
+    (ADMIN_CHAT_ID) черновик ответа с кнопками «Отправить» / «Изменить» /
+    «Не отправлять». Отправляется только после нажатия «Отправить», либо
+    текстом, который Николай сам пришлёт в ответ (Reply) на черновик.
+  • Команда /newpost <тема> (только для ADMIN_CHAT_ID) готовит черновик поста
+    в канал в уже сложившемся стиле канала, с теми же тремя кнопками —
+    «Опубликовать» / «Доработать» / «Отмена».
+
+Команды:
+  /myid              — присылает ваш chat_id, чтобы один раз настроить ADMIN_CHAT_ID
+  /stats             — сколько раз всего выдавался бесплатный гайд (только ADMIN_CHAT_ID)
+  /workbook          — открыть тетрадь (если доступ уже выдан) или узнать, как его получить
+  /grant <id> [note] — выдать доступ к тетради пользователю с этим telegram id (только ADMIN_CHAT_ID)
+  /revoke <id>       — забрать доступ (только ADMIN_CHAT_ID)
+  /newpost <тема>    — черновик нового поста в канал на подтверждение (только ADMIN_CHAT_ID)
+
 Переменные окружения:
   TELEGRAM_BOT_TOKEN    — токен бота от @BotFather (обязательно)
+  ANTHROPIC_API_KEY     — ключ Anthropic API (console.anthropic.com → API Keys) —
+                          нужен для черновиков ответов и постов; без него эти две
+                          функции просто не будут работать (остальной бот не затронут)
+  ANTHROPIC_MODEL       — необязательно, модель Claude для черновиков
+                          (по умолчанию claude-sonnet-4-5-20250929)
   CHANNEL_USERNAME      — username канала для проверки подписки, с @ (по умолчанию @prosto_prodash)
   ADMIN_CHAT_ID         — ваш personal chat_id для уведомлений, /stats, /grant, /revoke
   CHANNEL_URL           — ссылка на канал для кнопки (по умолчанию https://t.me/prosto_prodash)
@@ -83,6 +108,7 @@ from telegram.ext import (
 )
 
 from webapp_content import WEBAPP_SHELL_HTML, WORKBOOK_CONTENT_HTML
+from ai_draft import AIDraftError, draft_channel_post, draft_reply_to_lead
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("prosto_prodash_bot")
@@ -192,6 +218,50 @@ def revoke_access(user_id: int) -> bool:
 def has_access(user_id: int) -> bool:
     data = _load_access()
     return str(user_id) in data.get("granted", {})
+
+
+# ------------------------------------------------------------------------
+# AI-черновики: ответы лидам и посты в канал, ожидающие подтверждения
+# ------------------------------------------------------------------------
+# Хранится в памяти процесса, а не в файле — рассчитано на то, что админ
+# подтверждает черновик в течение минут, а не дней. Если бот перезапустится
+# (новый деплой, падение) до того, как черновик подтверждён — он потеряется,
+# и нажатие на его кнопки вежливо сообщит, что черновик устарел, вместо
+# падения бота.
+
+PENDING_REPLIES: dict = {}  # admin_message_id -> {user_chat_id, user_name, draft, original_text}
+PENDING_POSTS: dict = {}  # admin_message_id -> {draft, brief}
+
+REPLY_SEND_PREFIX = "reply_send:"
+REPLY_EDIT_PREFIX = "reply_edit:"
+REPLY_DISCARD_PREFIX = "reply_discard:"
+POST_PUBLISH_PREFIX = "post_publish:"
+POST_REVISE_PREFIX = "post_revise:"
+POST_CANCEL_PREFIX = "post_cancel:"
+
+
+def reply_review_keyboard(admin_msg_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("✅ Отправить", callback_data=f"{REPLY_SEND_PREFIX}{admin_msg_id}"),
+                InlineKeyboardButton("✏️ Изменить", callback_data=f"{REPLY_EDIT_PREFIX}{admin_msg_id}"),
+            ],
+            [InlineKeyboardButton("❌ Не отправлять", callback_data=f"{REPLY_DISCARD_PREFIX}{admin_msg_id}")],
+        ]
+    )
+
+
+def post_review_keyboard(admin_msg_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("✅ Опубликовать", callback_data=f"{POST_PUBLISH_PREFIX}{admin_msg_id}"),
+                InlineKeyboardButton("✏️ Доработать", callback_data=f"{POST_REVISE_PREFIX}{admin_msg_id}"),
+            ],
+            [InlineKeyboardButton("❌ Отмена", callback_data=f"{POST_CANCEL_PREFIX}{admin_msg_id}")],
+        ]
+    )
 
 
 # ------------------------------------------------------------------------
@@ -532,6 +602,216 @@ async def revoke(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await context.bot.send_message(chat_id=chat.id, text=text)
 
 
+LEAD_ACK_TEXT = "Принял ваше сообщение, отвечу в ближайшее время 🙌"
+
+ADMIN_HELP_TEXT = (
+    "Это рабочий чат бота. Команды: /newpost <тема> — черновик поста в "
+    "канал, /stats, /grant, /revoke, /myid."
+)
+
+
+async def newpost(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat = update.effective_chat
+    if not _is_admin(chat.id):
+        return
+
+    if not context.args:
+        await context.bot.send_message(
+            chat_id=chat.id,
+            text=(
+                "Использование: /newpost <тема или бриф поста>, например:\n"
+                "/newpost ошибка новичков - боятся задавать вопросы про бюджет клиента"
+            ),
+        )
+        return
+
+    brief = " ".join(context.args)
+    try:
+        draft = draft_channel_post(brief)
+    except AIDraftError as exc:
+        await context.bot.send_message(
+            chat_id=chat.id, text=f"⚠️ Не удалось сгенерировать черновик поста.\n{exc}"
+        )
+        return
+
+    admin_text = f"📝 Черновик поста в канал (тема: {brief})\n\n{draft}"
+    sent = await context.bot.send_message(chat_id=chat.id, text=admin_text)
+    PENDING_POSTS[sent.message_id] = {"draft": draft, "brief": brief}
+    await context.bot.edit_message_reply_markup(
+        chat_id=chat.id,
+        message_id=sent.message_id,
+        reply_markup=post_review_keyboard(sent.message_id),
+    )
+
+
+async def handle_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Свободный текст от админа — либо правка черновика через Reply, либо подсказка."""
+    chat = update.effective_chat
+    message = update.message
+    reply_to = message.reply_to_message
+    final_text = message.text or ""
+
+    if reply_to and reply_to.message_id in PENDING_REPLIES:
+        pending = PENDING_REPLIES.pop(reply_to.message_id)
+        try:
+            await context.bot.send_message(chat_id=pending["user_chat_id"], text=final_text)
+            await context.bot.send_message(chat_id=chat.id, text="✅ Отправлено вашим текстом.")
+        except TelegramError:
+            logger.exception("Could not deliver edited reply to user")
+            await context.bot.send_message(
+                chat_id=chat.id,
+                text="⚠️ Не удалось отправить — возможно, человек заблокировал бота.",
+            )
+        return
+
+    if reply_to and reply_to.message_id in PENDING_POSTS:
+        pending = PENDING_POSTS.pop(reply_to.message_id)
+        try:
+            await context.bot.send_message(chat_id=CHANNEL_USERNAME, text=final_text)
+            await context.bot.send_message(chat_id=chat.id, text="✅ Опубликовано вашим текстом.")
+        except TelegramError:
+            logger.exception("Could not publish edited post to channel")
+            await context.bot.send_message(
+                chat_id=chat.id,
+                text=(
+                    "⚠️ Не удалось опубликовать — проверьте, что бот добавлен в "
+                    "канал админом с правом публикации постов."
+                ),
+            )
+        return
+
+    await context.bot.send_message(chat_id=chat.id, text=ADMIN_HELP_TEXT)
+
+
+async def handle_lead_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Любое свободное текстовое сообщение, не попавшее под команды/кнопки меню."""
+    chat = update.effective_chat
+    user = update.effective_user
+    message = update.message
+
+    if _is_admin(chat.id):
+        await handle_admin_text(update, context)
+        return
+
+    original_text = message.text or ""
+
+    try:
+        await context.bot.send_message(chat_id=chat.id, text=LEAD_ACK_TEXT)
+    except TelegramError:
+        logger.exception("Could not send ack to user %s", user.id)
+
+    if not ADMIN_CHAT_ID:
+        # Некому подтверждать черновики — работаем как раньше, без AI.
+        await fallback(update, context)
+        return
+
+    try:
+        draft = draft_reply_to_lead(original_text, user.full_name)
+    except AIDraftError as exc:
+        logger.exception("AI draft failed for lead message")
+        await context.bot.send_message(
+            chat_id=ADMIN_CHAT_ID,
+            text=(
+                f"⚠️ Не удалось сгенерировать черновик ответа.\n{exc}\n\n"
+                f"Сообщение от {user.full_name} (id {user.id}):\n«{original_text}»\n\n"
+                "Ответьте человеку вручную."
+            ),
+        )
+        return
+
+    username = f"@{user.username}" if user.username else "(без username)"
+    admin_text = (
+        f"💬 Новое сообщение боту\n"
+        f"От: {user.full_name} {username} (id {user.id})\n\n"
+        f"«{original_text}»\n\n"
+        f"🤖 Черновик ответа:\n{draft}"
+    )
+    sent = await context.bot.send_message(chat_id=ADMIN_CHAT_ID, text=admin_text)
+    PENDING_REPLIES[sent.message_id] = {
+        "user_chat_id": chat.id,
+        "user_name": user.full_name,
+        "draft": draft,
+        "original_text": original_text,
+    }
+    await context.bot.edit_message_reply_markup(
+        chat_id=ADMIN_CHAT_ID,
+        message_id=sent.message_id,
+        reply_markup=reply_review_keyboard(sent.message_id),
+    )
+
+
+async def reply_review_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    data = query.data
+    admin_msg_id = int(data.split(":", 1)[1])
+    pending = PENDING_REPLIES.get(admin_msg_id)
+
+    if not pending:
+        await query.answer("Черновик уже обработан или устарел.", show_alert=True)
+        return
+
+    if data.startswith(REPLY_SEND_PREFIX):
+        PENDING_REPLIES.pop(admin_msg_id, None)
+        try:
+            await context.bot.send_message(chat_id=pending["user_chat_id"], text=pending["draft"])
+            await query.answer("Отправлено")
+            await query.edit_message_text(query.message.text + "\n\n✅ Отправлено.")
+        except TelegramError:
+            logger.exception("Could not deliver AI draft to user")
+            await query.answer("Не удалось отправить", show_alert=True)
+            await query.edit_message_text(
+                query.message.text
+                + "\n\n⚠️ Не удалось отправить (возможно, пользователь заблокировал бота)."
+            )
+    elif data.startswith(REPLY_EDIT_PREFIX):
+        await query.answer()
+        await query.edit_message_text(
+            query.message.text
+            + "\n\n✏️ Ответьте (Reply) на это сообщение своим текстом — я отправлю его вместо черновика."
+        )
+    elif data.startswith(REPLY_DISCARD_PREFIX):
+        PENDING_REPLIES.pop(admin_msg_id, None)
+        await query.answer("Отклонено")
+        await query.edit_message_text(query.message.text + "\n\n❌ Отклонено, ничего не отправлено.")
+
+
+async def post_review_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    data = query.data
+    admin_msg_id = int(data.split(":", 1)[1])
+    pending = PENDING_POSTS.get(admin_msg_id)
+
+    if not pending:
+        await query.answer("Черновик уже обработан или устарел.", show_alert=True)
+        return
+
+    if data.startswith(POST_PUBLISH_PREFIX):
+        PENDING_POSTS.pop(admin_msg_id, None)
+        try:
+            await context.bot.send_message(chat_id=CHANNEL_USERNAME, text=pending["draft"])
+            await query.answer("Опубликовано")
+            await query.edit_message_text(query.message.text + "\n\n✅ Опубликовано в канал.")
+        except TelegramError:
+            logger.exception("Could not publish AI draft to channel")
+            await query.answer("Не удалось опубликовать", show_alert=True)
+            await query.edit_message_text(
+                query.message.text
+                + "\n\n⚠️ Не удалось опубликовать — проверьте, что бот добавлен в канал "
+                "админом с правом публикации постов."
+            )
+    elif data.startswith(POST_REVISE_PREFIX):
+        await query.answer()
+        await query.edit_message_text(
+            query.message.text
+            + "\n\n✏️ Ответьте (Reply) на это сообщение готовым текстом поста — "
+            "я опубликую его вместо черновика."
+        )
+    elif data.startswith(POST_CANCEL_PREFIX):
+        PENDING_POSTS.pop(admin_msg_id, None)
+        await query.answer("Отменено")
+        await query.edit_message_text(query.message.text + "\n\n❌ Отменено.")
+
+
 async def channel_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat = update.effective_chat
     await context.bot.send_message(
@@ -640,10 +920,24 @@ def build_ptb_application() -> Application:
     application.add_handler(CommandHandler("grant", grant))
     application.add_handler(CommandHandler("revoke", revoke))
     application.add_handler(CallbackQueryHandler(check_subscription_callback, pattern=f"^{CHECK_SUB_CALLBACK}$"))
+    application.add_handler(CommandHandler("newpost", newpost))
+    application.add_handler(
+        CallbackQueryHandler(
+            reply_review_callback,
+            pattern=f"^({REPLY_SEND_PREFIX}|{REPLY_EDIT_PREFIX}|{REPLY_DISCARD_PREFIX})\\d+$",
+        )
+    )
+    application.add_handler(
+        CallbackQueryHandler(
+            post_review_callback,
+            pattern=f"^({POST_PUBLISH_PREFIX}|{POST_REVISE_PREFIX}|{POST_CANCEL_PREFIX})\\d+$",
+        )
+    )
     application.add_handler(MessageHandler(filters.Text([BTN_FREE_GUIDE]), start))
     application.add_handler(MessageHandler(filters.Text([BTN_CHANNEL]), channel_button))
     application.add_handler(MessageHandler(filters.Text([BTN_MINI_PRODUCT]), workbook))
     application.add_handler(MessageHandler(filters.Text([BTN_INSTAGRAM]), instagram_button))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_lead_text))
     application.add_handler(MessageHandler(filters.ALL, fallback))
     application.add_error_handler(error_handler)
     return application
